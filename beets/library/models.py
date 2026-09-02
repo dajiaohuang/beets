@@ -931,7 +931,7 @@ class Item(LibModel):
         if read_path == self.path:
             self.mtime = self.current_mtime()
 
-        self.path = read_path
+        self.path = os.fsencode(read_path)
 
     def write(
         self,

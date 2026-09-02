@@ -1,7 +1,17 @@
+import json
+import os
+import shutil
+import tempfile
+import unittest
+from unittest import mock
+
+import pytest
 import responses
 
+from beets.exceptions import UserError
 from beets.test.helper import PluginTestCase
-from beetsplug.plexupdate import get_music_section, update_plex
+from beetsplug._utils.requests import SingletonMeta
+from beetsplug.plexupdate import PLEX_API, PlexAPI, PlexSession
 
 
 class PlexUpdateTest(PluginTestCase):
@@ -10,56 +20,24 @@ class PlexUpdateTest(PluginTestCase):
     def add_response_get_music_section(self, section_name="Music"):
         """Create response for mocking the get_music_section function."""
 
-        escaped_section_name = section_name.replace('"', '\\"')
-
-        body = (
-            '<?xml version="1.0" encoding="UTF-8"?>'
-            '<MediaContainer size="3" allowSync="0" '
-            'identifier="com.plexapp.plugins.library" '
-            'mediaTagPrefix="/system/bundle/media/flags/" '
-            'mediaTagVersion="1413367228" title1="Plex Library">'
-            '<Directory allowSync="0" art="/:/resources/movie-fanart.jpg" '
-            'filters="1" refreshing="0" thumb="/:/resources/movie.png" '
-            'key="3" type="movie" title="Movies" '
-            'composite="/library/sections/3/composite/1416232668" '
-            'agent="com.plexapp.agents.imdb" scanner="Plex Movie Scanner" '
-            'language="de" uuid="92f68526-21eb-4ee2-8e22-d36355a17f1f" '
-            'updatedAt="1416232668" createdAt="1415720680">'
-            '<Location id="3" path="/home/marv/Media/Videos/Movies" />'
-            "</Directory>"
-            '<Directory allowSync="0" art="/:/resources/artist-fanart.jpg" '
-            'filters="1" refreshing="0" thumb="/:/resources/artist.png" '
-            f'key="2" type="artist" title="{escaped_section_name}" '
-            'composite="/library/sections/2/composite/1416929243" '
-            'agent="com.plexapp.agents.lastfm" scanner="Plex Music Scanner" '
-            'language="en" uuid="90897c95-b3bd-4778-a9c8-1f43cb78f047" '
-            'updatedAt="1416929243" createdAt="1415691331">'
-            '<Location id="2" path="/home/marv/Media/Musik" />'
-            "</Directory>"
-            '<Directory allowSync="0" art="/:/resources/show-fanart.jpg" '
-            'filters="1" refreshing="0" thumb="/:/resources/show.png" '
-            'key="1" type="show" title="TV Shows" '
-            'composite="/library/sections/1/composite/1416320800" '
-            'agent="com.plexapp.agents.thetvdb" scanner="Plex Series Scanner" '
-            'language="de" uuid="04d2249b-160a-4ae9-8100-106f4ec1a218" '
-            'updatedAt="1416320800" createdAt="1415690983">'
-            '<Location id="1" path="/home/marv/Media/Videos/Series" />'
-            "</Directory>"
-            "</MediaContainer>"
-        )
-        status = 200
-        content_type = "text/xml;charset=utf-8"
-
         responses.add(
             responses.GET,
             "http://localhost:32400/library/sections",
-            body=body,
-            status=status,
-            content_type=content_type,
+            status=200,
+            json={
+                "MediaContainer": {
+                    "size": 3,
+                    "Directory": [
+                        {"key": "3", "type": "movie", "title": "Movies"},
+                        {"key": "2", "type": "artist", "title": section_name},
+                        {"key": "1", "type": "show", "title": "TV Shows"},
+                    ],
+                }
+            },
         )
 
     def add_response_update_plex(self):
-        """Create response for mocking the update_plex function."""
+        """Create response for mocking the update_library request."""
         body = ""
         status = 200
         content_type = "text/html"
@@ -76,6 +54,28 @@ class PlexUpdateTest(PluginTestCase):
         super().setUp()
 
         self.config["plex"] = {"host": "localhost", "port": 32400}
+        self.tempdir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        super().tearDown()
+        shutil.rmtree(self.tempdir)
+        # PlexSession is a singleton; drop it so other tests get a
+        # session bound to their own token path.
+        SingletonMeta._instances.pop(PlexSession, None)
+
+    def api(self, **kwargs) -> PlexAPI:
+        """PlexAPI bound to the test configuration."""
+        options = {
+            "token_override": "",
+            "host": "localhost",
+            "port": 32400,
+            "library_name": "Music",
+            "secure": False,
+            "verify": True,
+            "token_path": os.path.join(self.tempdir, "plex_token.json"),
+        }
+        options.update(kwargs)
+        return PlexAPI(**options)
 
     @responses.activate
     def test_get_music_section(self):
@@ -83,17 +83,7 @@ class PlexUpdateTest(PluginTestCase):
         self.add_response_get_music_section()
 
         # Test if section key is "2" out of the mocking data.
-        assert (
-            get_music_section(
-                self.config["plex"]["host"],
-                self.config["plex"]["port"],
-                self.config["plex"]["token"],
-                self.config["plex"]["library_name"].get(),
-                self.config["plex"]["secure"],
-                self.config["plex"]["ignore_cert_errors"],
-            )
-            == "2"
-        )
+        assert self.api().get_music_section() == "2"
 
     @responses.activate
     def test_get_named_music_section(self):
@@ -101,32 +91,198 @@ class PlexUpdateTest(PluginTestCase):
         self.add_response_get_music_section("My Music Library")
 
         assert (
-            get_music_section(
-                self.config["plex"]["host"],
-                self.config["plex"]["port"],
-                self.config["plex"]["token"],
-                "My Music Library",
-                self.config["plex"]["secure"],
-                self.config["plex"]["ignore_cert_errors"],
-            )
-            == "2"
+            self.api(library_name="My Music Library").get_music_section() == "2"
         )
 
     @responses.activate
-    def test_update_plex(self):
+    def test_update_library(self):
         # Adding responses.
         self.add_response_get_music_section()
         self.add_response_update_plex()
 
         # Testing status code of the mocking request.
-        assert (
-            update_plex(
-                self.config["plex"]["host"],
-                self.config["plex"]["port"],
-                self.config["plex"]["token"],
-                self.config["plex"]["library_name"].get(),
-                self.config["plex"]["secure"],
-                self.config["plex"]["ignore_cert_errors"],
-            ).status_code
-            == 200
+        assert self.api().update_library().status_code == 200
+
+    @responses.activate
+    def test_update_library_missing_section(self):
+        # The Plex server has no section with the configured name.
+        self.add_response_get_music_section("Other Library")
+
+        with pytest.raises(UserError, match="No music library named"):
+            self.api().update_library()
+
+
+class PlexAuthTestBase(unittest.TestCase):
+    """Shared setup and mocked plex.tv responses for the auth tests."""
+
+    def setUp(self):
+        self.tempdir = tempfile.mkdtemp()
+        self.token_path = os.path.join(self.tempdir, "plex_token.json")
+
+    def tearDown(self):
+        shutil.rmtree(self.tempdir)
+        # PlexSession is a singleton; drop it so each test gets a session
+        # bound to its own token path.
+        SingletonMeta._instances.pop(PlexSession, None)
+
+    def add_response_create_pin(self):
+        responses.add(
+            responses.POST,
+            f"{PLEX_API}/pins",
+            status=200,
+            json={"id": 1, "code": "ABCD", "expiresIn": 1800},
         )
+
+    def add_response_poll_pin(self, auth_token=None):
+        data = {"id": 1, "code": "ABCD"}
+        if auth_token:
+            data["authToken"] = auth_token
+        responses.add(
+            responses.GET, f"{PLEX_API}/pins/1", status=200, json=data
+        )
+
+
+class PlexSessionTest(PlexAuthTestBase):
+    def setUp(self):
+        super().setUp()
+        self.session = PlexSession(token_path=self.token_path)
+
+    def test_session_headers(self):
+        """The session sends the identifying Plex headers."""
+        assert self.session.headers["X-Plex-Product"] == "beets"
+        assert (
+            self.session.headers["X-Plex-Client-Identifier"]
+            == self.session.client_id
+        )
+
+    @responses.activate
+    def test_wait_for_login_timeout(self):
+        # The pin never gets an authToken.
+        self.add_response_poll_pin()
+
+        with mock.patch("beetsplug.plexupdate.time.sleep"):
+            assert self.session.wait_for_login(1, timeout=1) is None
+
+    def test_loads_stored_token(self):
+        """The token is read from the token file."""
+        with open(self.token_path, "w") as f:
+            json.dump(
+                {"X-Plex-Token": "TOKEN", "client_identifier": "prev-id"}, f
+            )
+
+        assert self.session.token == "TOKEN"
+
+    def test_session_saves_token(self):
+        """Token persistence is handled by the session."""
+        self.session.save_token({"X-Plex-Token": "TOKEN123"})
+
+        assert self.session.token == "TOKEN123"
+        assert self.session.load_token() == {
+            "X-Plex-Token": "TOKEN123",
+            "client_identifier": self.session.client_id,
+        }
+
+    @responses.activate
+    def test_request_attaches_token_to_local_server(self):
+        """The stored token is sent to the local server."""
+        responses.add(
+            responses.GET,
+            "http://localhost:32400/library/sections",
+            status=200,
+            json={},
+        )
+        self.session.save_token({"X-Plex-Token": "TOKEN123"})
+
+        self.session.get("http://localhost:32400/library/sections")
+
+        assert responses.calls[0].request.headers["X-Plex-Token"] == "TOKEN123"
+
+    @responses.activate
+    def test_request_prefers_configured_token(self):
+        """The configured token wins over the stored plex.tv token."""
+        SingletonMeta._instances.pop(PlexSession, None)
+        session = PlexSession(
+            token_path=self.token_path, token_override="CONFIG_TOKEN"
+        )
+        session.save_token({"X-Plex-Token": "TOKEN123"})
+        responses.add(
+            responses.GET,
+            "http://localhost:32400/library/sections",
+            status=200,
+            json={},
+        )
+
+        session.get("http://localhost:32400/library/sections")
+
+        assert (
+            responses.calls[0].request.headers["X-Plex-Token"] == "CONFIG_TOKEN"
+        )
+
+
+class PlexAPITest(PlexAuthTestBase):
+    def setUp(self):
+        super().setUp()
+        self.api = PlexAPI(
+            token_path=self.token_path,
+            token_override="",
+            host="localhost",
+            port=32400,
+            library_name="Music",
+            secure=False,
+            verify=True,
+        )
+
+    @responses.activate
+    def test_ui_authenticate_flow(self):
+        self.add_response_create_pin()
+        # First poll is still pending, second grants access.
+        self.add_response_poll_pin()
+        self.add_response_poll_pin(auth_token="TOKEN123")
+
+        with (
+            mock.patch("beetsplug.plexupdate.time.sleep"),
+            mock.patch("beetsplug.plexupdate.webbrowser.open") as open_mock,
+        ):
+            self.api.ui_authenticate_flow()
+
+        open_mock.assert_called_once()
+
+        # The pin request carries the identifying headers.
+        request = responses.calls[0].request
+        assert (
+            request.headers["X-Plex-Client-Identifier"]
+            == self.api.session.client_id
+        )
+
+        # The access token is persisted for later runs.
+        assert self.api.session.token == "TOKEN123"
+        with open(self.token_path) as f:
+            data = json.load(f)
+        assert data["X-Plex-Token"] == "TOKEN123"
+        assert data["client_identifier"] == self.api.session.client_id
+
+    @responses.activate
+    def test_ui_authenticate_flow_timeout(self):
+        self.add_response_create_pin()
+
+        with (
+            mock.patch("beetsplug.plexupdate.time.sleep"),
+            mock.patch("beetsplug.plexupdate.webbrowser.open"),
+            mock.patch.object(
+                self.api.session, "wait_for_login", return_value=None
+            ),
+        ):
+            with pytest.raises(UserError):
+                self.api.ui_authenticate_flow()
+
+        # No token is stored when the login is not completed.
+        assert self.api.session.token is None
+
+    @responses.activate
+    def test_ui_authenticate_flow_network_error(self):
+        # A failing plex.tv request surfaces as a UserError instead of a
+        # raw requests exception.
+        responses.add(responses.POST, f"{PLEX_API}/pins", status=500)
+
+        with pytest.raises(UserError, match="Plex login flow failed"):
+            self.api.ui_authenticate_flow()
